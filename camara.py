@@ -6,51 +6,54 @@ import threading
 import glob
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-BAUD = 115200
+# ──────────────────────────────────────────────────────────────────────────────
+# CONFIGURACIÓN GLOBALES
+# ──────────────────────────────────────────────────────────────────────────────
+BAUD = 115200  # Baudrate seguro para arquitectura ARM / Radxa
 HEADER = b'\x00\xFF'
 
 latest_frame = None
 frame_lock = threading.Lock()
 
-def encontrar_puerto_usb():
-    """Busca cualquier puerto ttyUSB disponible (/dev/ttyUSB0, /dev/ttyUSB1, etc.)"""
-    puertos = glob.glob('/dev/ttyUSB*')
-    if puertos:
-        return sorted(puertos)[0] # Retorna el primero encontrado
-    return None
-
 def conectar_camara():
-    """Intenta abrir la cámara y reconfigurarla con comandos AT"""
+    """Escanea y prueba todos los puertos /dev/ttyUSB* hasta inicializar la cámara."""
     while True:
-        puerto = encontrar_puerto_usb()
-        if puerto:
+        puertos = sorted(glob.glob('/dev/ttyUSB*'))
+        if not puertos:
+            print("[🔍] Buscando cámara USB... (verificá que esté conectada)", end="\r")
+            time.sleep(2)
+            continue
+
+        for puerto in puertos:
             try:
-                print(f"\n[🔌] Intentando conectar en {puerto}...")
+                print(f"\n[🔌] Probando conexión en {puerto}...")
                 ser = serial.Serial(puerto, BAUD, timeout=1)
                 ser.reset_input_buffer()
                 ser.reset_output_buffer()
                 
-                # Enviar comandos de inicialización
+                # Secuencia de comandos AT de inicialización
                 comandos = [b"AT+ISP=1\r\n", b"AT+DISP=2\r\n", b"AT+UNIT=2\r\n", b"AT+BINN=1\r\n"]
                 for cmd in comandos:
                     ser.write(cmd)
                     time.sleep(0.1)
                 
                 ser.reset_input_buffer()
-                print(f"[✅] ¡Conectado con éxito en {puerto}!")
+                print(f"[✅] ¡Cámara inicializada con éxito en {puerto}!")
                 return ser
+
+            except PermissionError:
+                print(f"[❌] Error 13 (Permiso denegado) en {puerto}.")
+                print(f"     👉 Ejecutá en terminal: sudo chmod 666 {puerto}")
             except Exception as e:
                 print(f"[⚠️] No se pudo abrir {puerto}: {e}")
-        else:
-            print("[🔍] Buscando cámara USB... (asegúrate de que esté enchufada)", end="\r")
         
-        time.sleep(2)
+        print("[🔄] Ningún puerto respondió. Reintentando en 3 segundos...")
+        time.sleep(3)
 
 def camara_reader():
     global latest_frame
     
     ser = conectar_camara()
-    
     buffer = bytearray()
     total_bytes = 0
     frames_count = 0
@@ -86,6 +89,7 @@ def camara_reader():
                     packet = buffer[:packet_size]
                     buffer = buffer[packet_size:]
                     
+                    # Extracción correcta de dimensiones (100x100)
                     cols = packet[14] if len(packet) > 14 and packet[14] > 0 else 100
                     rows = packet[15] if len(packet) > 15 and packet[15] > 0 else 100
                     
@@ -95,7 +99,7 @@ def camara_reader():
                     if len(packet) >= img_end:
                         img_bytes = packet[img_start:img_end]
                         raw_img = np.array(img_bytes, dtype=np.uint8).reshape((rows, cols))
-                        raw_img = cv2.flip(raw_img, 1)
+                        raw_img = cv2.flip(raw_img, 1)  # Efecto espejo
                         
                         big_img = cv2.resize(raw_img, (500, 500), interpolation=cv2.INTER_NEAREST)
                         color_img = cv2.applyColorMap(big_img, cv2.COLORMAP_JET)
@@ -110,17 +114,20 @@ def camara_reader():
 
         except Exception as e:
             print(f"\n\n[❌] Desconexión detectada o Error I/O: {e}")
-            print("[🔄] Reiniciando puerto y reconectando...")
+            print("[🔄] Intentando reconectar automáticamente...")
             try:
                 ser.close()
-            except:
+            except Exception:
                 pass
             time.sleep(1)
-            ser = conectar_camara() # Reintenta conectar en bucle hasta que reviva
+            ser = conectar_camara()  # Bucle de reintento hasta restablecer comunicación
             buffer = bytearray()
             
         time.sleep(0.001)
 
+# ──────────────────────────────────────────────────────────────────────────────
+# SERVIDOR WEB MJPEG
+# ──────────────────────────────────────────────────────────────────────────────
 class StreamingHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         global latest_frame
@@ -129,11 +136,15 @@ class StreamingHandler(BaseHTTPRequestHandler):
             self.send_header('Content-type', 'text/html')
             self.end_headers()
             html = """
+            <!DOCTYPE html>
             <html>
-            <head><title>Radxa ToF Stream</title></head>
+            <head>
+                <title>Radxa ToF Stream</title>
+                <meta charset="utf-8">
+            </head>
             <body style="background:#1e1e2e; color:#cdd6f4; font-family:sans-serif; display:flex; flex-direction:column; align-items:center; justify-content:center; height:100vh; margin:0;">
                 <h2>Stream ToF (Sipeed A010)</h2>
-                <div style="border: 4px solid #45475a; border-radius: 12px; overflow: hidden;">
+                <div style="border: 4px solid #45475a; border-radius: 12px; overflow: hidden; box-shadow: 0 10px 30px rgba(0,0,0,0.5);">
                     <img src="/stream" width="500" height="500" />
                 </div>
             </body>
@@ -173,12 +184,14 @@ class StreamingHandler(BaseHTTPRequestHandler):
 def run_server():
     server = HTTPServer(('0.0.0.0', 8085), StreamingHandler)
     print("\n[🌍] Servidor Web Activo en el puerto 8085")
+    print("     👉 Ingresá desde tu PC a: http://<IP-DE-LA-RADXA>:8085\n")
     server.serve_forever()
 
 if __name__ == '__main__':
+    # Otorgar permisos rápidos si hiciera falta antes de arrancar
     thr = threading.Thread(target=camara_reader, daemon=True)
     thr.start()
     try:
         run_server()
     except KeyboardInterrupt:
-        print("\n👋 Cerrando...")
+        print("\n👋 Cerrando servidor de forma limpia...")
