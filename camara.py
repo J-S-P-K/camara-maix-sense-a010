@@ -5,43 +5,48 @@ import numpy as np
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
+# ──────────────────────────────────────────────────────────────────────────────
+# CONFIGURACIÓN
+# ──────────────────────────────────────────────────────────────────────────────
 PORT = "/dev/ttyUSB0"
-# 921600 es la velocidad oficial de la Sipeed A010 para streaming de imagen
-BAUD = 921600
+BAUD = 115200  # Velocidad 100% segura para ARM/Radxa
 HEADER = b'\x00\xFF'
 
 latest_frame = None
 frame_lock = threading.Lock()
 
+# ──────────────────────────────────────────────────────────────────────────────
+# HILO 1: LECTOR SERIAL Y DECODIFICADOR TOF
+# ──────────────────────────────────────────────────────────────────────────────
 def camara_reader():
     global latest_frame
 
-    print(f"[Serial] Intentando conectar a {PORT} a {BAUD} baudios...")
+    print(f"\n[1/4] Abriendo puerto {PORT} a {BAUD} baudios (Modo Seguro)...")
     try:
         ser = serial.Serial(PORT, BAUD, timeout=1)
         ser.reset_input_buffer()
         ser.reset_output_buffer()
+        print("[✅] Puerto abierto correctamente. Sin errores de I/O.")
     except Exception as e:
-        print(f"❌ [Serial ERROR] No se pudo abrir a {BAUD}: {e}")
-        print("[Serial] Reintentando a 115200 por seguridad...")
-        try:
-            ser = serial.Serial(PORT, 115200, timeout=1)
-        except Exception as e2:
-            print(f"❌ [Serial ERROR] Tampoco se pudo abrir a 115200: {e2}")
-            return
+        print(f"[❌] Error fatal al abrir el puerto: {e}")
+        return
 
-    # Enviamos la secuencia de comandos para despertar el streaming
-    print("[Serial] Enviando comandos de inicio a la cámara...")
-    comandos = [b"AT+ISP=1\r\n", b"AT+DISP=3\r\n", b"AT+UNIT=2\r\n", b"AT+BINN=1\r\n"]
+    print("[2/4] Configurando la cámara (Comandos AT)...")
+    # AT+DISP=2 fuerza a la cámara a mandar el video SÓLO por USB para no saturarla
+    comandos = [b"AT+ISP=1\r\n", b"AT+DISP=2\r\n", b"AT+UNIT=2\r\n", b"AT+BINN=1\r\n"]
+    
     for cmd in comandos:
         ser.write(cmd)
         time.sleep(0.1)
 
     ser.reset_input_buffer()
-    buffer = bytearray()
+    print("[✅] Comandos enviados.")
+    print("[3/4] Escuchando flujo de video...")
     
+    buffer = bytearray()
+    total_bytes = 0
     last_debug_time = time.time()
-    total_bytes_received = 0
+    frames_decodificados = 0
 
     while True:
         try:
@@ -49,29 +54,36 @@ def camara_reader():
             if waiting > 0:
                 chunk = ser.read(waiting)
                 buffer += chunk
-                total_bytes_received += len(chunk)
+                total_bytes += len(chunk)
                 
-                # Procesamiento del buffer de imágenes
+                # Búsqueda y decodificación del paquete binario
                 while len(buffer) >= 4:
                     idx = buffer.find(HEADER)
+                    
                     if idx == -1:
+                        # Si no hay cabecera, descartamos basura reteniendo el último byte por si es la mitad del header
                         buffer = buffer[-1:]
                         break
+                        
                     if idx > 0:
+                        # Cortamos la basura antes del header
                         buffer = buffer[idx:]
                         if len(buffer) < 4:
                             break
                     
+                    # Leemos el tamaño del payload (bytes 2 y 3 en little endian)
                     payload_len = int.from_bytes(buffer[2:4], 'little')
                     packet_size = 4 + payload_len
                     
+                    # Filtro de seguridad: Un frame de 100x100 pesa aprox 10.000 bytes
                     if packet_size > 11000 or packet_size < 20:
-                        buffer = buffer[2:]
+                        buffer = buffer[2:] # Header corrupto, lo saltamos
                         continue
                     
                     if len(buffer) < packet_size:
-                        break
+                        break # Faltan llegar bytes para completar el frame
                     
+                    # ¡Tenemos un paquete completo!
                     packet = buffer[:packet_size]
                     buffer = buffer[packet_size:]
                     
@@ -85,7 +97,7 @@ def camara_reader():
                     if len(packet) >= img_end:
                         img_bytes = packet[img_start:img_end]
                         raw_img = np.array(img_bytes, dtype=np.uint8).reshape((rows, cols))
-                        raw_img = cv2.flip(raw_img, 1)
+                        raw_img = cv2.flip(raw_img, 1) # Efecto espejo
                         
                         big_img = cv2.resize(raw_img, (500, 500), interpolation=cv2.INTER_NEAREST)
                         color_img = cv2.applyColorMap(big_img, cv2.COLORMAP_JET)
@@ -95,19 +107,41 @@ def camara_reader():
                         with frame_lock:
                             latest_frame = jpeg.tobytes()
                             
-                        print(f"📷 [OK] Frame capturado! ({cols}x{rows} px) | Total RX: {total_bytes_received} bytes", end="\r")
+                        frames_decodificados += 1
+                        last_debug_time = time.time() # Reseteamos el timer de debug
+                        print(f"📷 [OK] Frame {frames_decodificados} capturado! ({cols}x{rows}) | RX: {total_bytes} bytes", end="\r")
 
-            # Muestra de vida cada 2 segundos si no hay frames completos
-            if time.time() - last_debug_time > 2.0:
-                print(f"[Diagnóstico] Estado del puerto: Leyendo... | Total acumulado: {total_bytes_received} bytes en buffer")
+            # ──────────────────────────────────────────────────────────────────
+            # SISTEMA DE DEBUG EN TIEMPO REAL (Se activa si no hay frames)
+            # ──────────────────────────────────────────────────────────────────
+            if time.time() - last_debug_time > 2.5:
+                print(f"\n[⚠️ DEBUG] Sin frames de video en los últimos 2.5s.")
+                print(f"    -> Total de bytes recibidos desde inicio: {total_bytes}")
+                print(f"    -> Tamaño del buffer actual esperando procesar: {len(buffer)} bytes")
+                
+                if len(buffer) > 0:
+                    # Mostramos los primeros 40 caracteres para ver si es texto de error o ruido
+                    hex_data = buffer[:40].hex()
+                    try:
+                        text_data = buffer[:40].decode('ascii', errors='ignore').replace('\r', '').replace('\n', ' ')
+                        print(f"    -> Datos crudos (Texto): '{text_data}'")
+                    except:
+                        pass
+                    print(f"    -> Datos crudos (Hex):   {hex_data}...")
+                else:
+                    print("    -> El puerto está en completo silencio (Revisar conexión física o energía).")
+                    
                 last_debug_time = time.time()
 
         except Exception as e:
-            print(f"\n⚠️ [Serial] Error en lectura: {e}")
+            print(f"\n[❌] Excepción en la lectura serial: {e}")
             time.sleep(0.5)
             
         time.sleep(0.001)
 
+# ──────────────────────────────────────────────────────────────────────────────
+# HILO 2: SERVIDOR WEB (No se toca, funcionaba perfecto)
+# ──────────────────────────────────────────────────────────────────────────────
 class StreamingHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         global latest_frame
@@ -117,9 +151,9 @@ class StreamingHandler(BaseHTTPRequestHandler):
             self.end_headers()
             html = """
             <html>
-            <head><title>Radxa - Maix Sense Stream</title></head>
+            <head><title>Radxa ToF Stream</title></head>
             <body style="background:#1e1e2e; color:#cdd6f4; font-family:sans-serif; display:flex; flex-direction:column; align-items:center; justify-content:center; height:100vh; margin:0;">
-                <h2>Stream ToF desde Radxa Dragon</h2>
+                <h2>Stream ToF (Sipeed A010)</h2>
                 <div style="border: 4px solid #45475a; border-radius: 12px; overflow: hidden;">
                     <img src="/stream" width="500" height="500" />
                 </div>
@@ -159,8 +193,8 @@ class StreamingHandler(BaseHTTPRequestHandler):
 
 def run_server():
     server = HTTPServer(('0.0.0.0', 8085), StreamingHandler)
-    print("\n🌍 [Web] Servidor activo!")
-    print("🌍 Ingresá desde tu PC a: http://<IP-DE-TU-RADXA>:8085\n")
+    print("\n[4/4] 🌍 ¡Servidor Web Activo!")
+    print("      👉 Ingresá desde el navegador de tu PC a: http://<IP-DE-LA-RADXA>:8085\n")
     server.serve_forever()
 
 if __name__ == '__main__':
@@ -169,4 +203,4 @@ if __name__ == '__main__':
     try:
         run_server()
     except KeyboardInterrupt:
-        print("\n👋 Cerrando...")
+        print("\n👋 Cerrando programa...")
