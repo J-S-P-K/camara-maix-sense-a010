@@ -6,48 +6,58 @@ import threading
 import glob
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-# ──────────────────────────────────────────────────────────────────────────────
-# CONFIGURACIÓN GLOBALES
-# ──────────────────────────────────────────────────────────────────────────────
-BAUD = 115200  # Baudrate seguro para arquitectura ARM / Radxa
+BAUD = 115200
 HEADER = b'\x00\xFF'
 
 latest_frame = None
 frame_lock = threading.Lock()
 
 def conectar_camara():
-    """Escanea y prueba todos los puertos /dev/ttyUSB* hasta inicializar la cámara."""
+    """Busca en todos los puertos ttyUSB y verifica cuál transmite datos ToF reales"""
     while True:
         puertos = sorted(glob.glob('/dev/ttyUSB*'))
         if not puertos:
-            print("[🔍] Buscando cámara USB... (verificá que esté conectada)", end="\r")
+            print("[🔍] Buscando puertos USB disponibles...", end="\r")
             time.sleep(2)
             continue
 
+        print(f"\n[Ports] Puertos detectados: {puertos}")
+
         for puerto in puertos:
             try:
-                print(f"\n[🔌] Probando conexión en {puerto}...")
+                print(f"[🔌] Probando interfaz en {puerto}...")
                 ser = serial.Serial(puerto, BAUD, timeout=1)
                 ser.reset_input_buffer()
                 ser.reset_output_buffer()
                 
-                # Secuencia de comandos AT de inicialización
+                # Comandos de activación de transmisión USB
                 comandos = [b"AT+ISP=1\r\n", b"AT+DISP=2\r\n", b"AT+UNIT=2\r\n", b"AT+BINN=1\r\n"]
                 for cmd in comandos:
                     ser.write(cmd)
                     time.sleep(0.1)
                 
                 ser.reset_input_buffer()
-                print(f"[✅] ¡Cámara inicializada con éxito en {puerto}!")
-                return ser
+                
+                # Leemos los primeros bytes para validar que sea la interfaz correcta
+                time.sleep(0.3)
+                if ser.in_waiting > 0:
+                    sample = ser.read(min(ser.in_waiting, 500))
+                    if HEADER in sample:
+                        print(f"[✅] ¡ÉXITO! Se detectó flujo ToF válido en {puerto}")
+                        return ser
+                    else:
+                        print(f"[⚠️] {puerto} está abierto pero no responde cabeceras ToF (probablemente puerto Debug).")
+                else:
+                    print(f"[⚠️] {puerto} no devolvió bytes. Probando siguiente...")
+                
+                ser.close()
 
             except PermissionError:
-                print(f"[❌] Error 13 (Permiso denegado) en {puerto}.")
-                print(f"     👉 Ejecutá en terminal: sudo chmod 666 {puerto}")
+                print(f"[❌] Permiso denegado en {puerto}. Ejecutá: sudo chmod 666 {puerto}")
             except Exception as e:
-                print(f"[⚠️] No se pudo abrir {puerto}: {e}")
+                print(f"[⚠️] Error al probar {puerto}: {e}")
         
-        print("[🔄] Ningún puerto respondió. Reintentando en 3 segundos...")
+        print("[🔄] Reintentando búsqueda de interfaz ToF en 3 segundos...")
         time.sleep(3)
 
 def camara_reader():
@@ -89,7 +99,6 @@ def camara_reader():
                     packet = buffer[:packet_size]
                     buffer = buffer[packet_size:]
                     
-                    # Extracción correcta de dimensiones (100x100)
                     cols = packet[14] if len(packet) > 14 and packet[14] > 0 else 100
                     rows = packet[15] if len(packet) > 15 and packet[15] > 0 else 100
                     
@@ -99,8 +108,16 @@ def camara_reader():
                     if len(packet) >= img_end:
                         img_bytes = packet[img_start:img_end]
                         raw_img = np.array(img_bytes, dtype=np.uint8).reshape((rows, cols))
-                        raw_img = cv2.flip(raw_img, 1)  # Efecto espejo
                         
+                        # VALIDACIÓN DE DATOS VALIDOS
+                        val_promedio = np.mean(raw_img)
+                        if val_promedio == 255.0:
+                            # 255 significa "fuera de rango" o "sin datos" en el sensor
+                            status_msg = " [⚠️ Trama en blanco/255] "
+                        else:
+                            status_msg = f" [OK - Dist. Promedio: {int(val_promedio)}mm] "
+
+                        raw_img = cv2.flip(raw_img, 1) # Espejo
                         big_img = cv2.resize(raw_img, (500, 500), interpolation=cv2.INTER_NEAREST)
                         color_img = cv2.applyColorMap(big_img, cv2.COLORMAP_JET)
                         
@@ -110,24 +127,20 @@ def camara_reader():
                             latest_frame = jpeg.tobytes()
                             
                         frames_count += 1
-                        print(f"📷 [STREAM ACTIVO] Frame #{frames_count} ({cols}x{rows}px) | Bytes: {total_bytes}  ", end="\r")
+                        print(f"📷 Frame #{frames_count} ({cols}x{rows}px){status_msg}| Bytes: {total_bytes}  ", end="\r")
 
         except Exception as e:
-            print(f"\n\n[❌] Desconexión detectada o Error I/O: {e}")
-            print("[🔄] Intentando reconectar automáticamente...")
+            print(f"\n\n[❌] Desconexión o error de lectura: {e}")
             try:
                 ser.close()
             except Exception:
                 pass
             time.sleep(1)
-            ser = conectar_camara()  # Bucle de reintento hasta restablecer comunicación
+            ser = conectar_camara()
             buffer = bytearray()
             
         time.sleep(0.001)
 
-# ──────────────────────────────────────────────────────────────────────────────
-# SERVIDOR WEB MJPEG
-# ──────────────────────────────────────────────────────────────────────────────
 class StreamingHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         global latest_frame
@@ -138,13 +151,10 @@ class StreamingHandler(BaseHTTPRequestHandler):
             html = """
             <!DOCTYPE html>
             <html>
-            <head>
-                <title>Radxa ToF Stream</title>
-                <meta charset="utf-8">
-            </head>
+            <head><title>Radxa ToF Stream</title></head>
             <body style="background:#1e1e2e; color:#cdd6f4; font-family:sans-serif; display:flex; flex-direction:column; align-items:center; justify-content:center; height:100vh; margin:0;">
                 <h2>Stream ToF (Sipeed A010)</h2>
-                <div style="border: 4px solid #45475a; border-radius: 12px; overflow: hidden; box-shadow: 0 10px 30px rgba(0,0,0,0.5);">
+                <div style="border: 4px solid #45475a; border-radius: 12px; overflow: hidden;">
                     <img src="/stream" width="500" height="500" />
                 </div>
             </body>
@@ -184,14 +194,12 @@ class StreamingHandler(BaseHTTPRequestHandler):
 def run_server():
     server = HTTPServer(('0.0.0.0', 8085), StreamingHandler)
     print("\n[🌍] Servidor Web Activo en el puerto 8085")
-    print("     👉 Ingresá desde tu PC a: http://<IP-DE-LA-RADXA>:8085\n")
     server.serve_forever()
 
 if __name__ == '__main__':
-    # Otorgar permisos rápidos si hiciera falta antes de arrancar
     thr = threading.Thread(target=camara_reader, daemon=True)
     thr.start()
     try:
         run_server()
     except KeyboardInterrupt:
-        print("\n👋 Cerrando servidor de forma limpia...")
+        print("\n👋 Cerrando...")
