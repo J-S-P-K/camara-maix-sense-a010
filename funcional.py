@@ -10,10 +10,9 @@ BAUD = 115200
 HEADER = b'\x00\xFF'
 
 # --- CONFIGURACIÓN DE RENDIMIENTO Y CALIDAD ---
-TARGET_FPS = 15                 # Tasa de cuadros por segundo deseada
-FRAME_INTERVAL = 1.0 / TARGET_FPS # Intervalo de tiempo entre frames (~0.066s)
-JPEG_QUALITY = 40               # Calidad de compresión JPEG (1 a 100, menor = menos peso/calidad)
-STREAM_SIZE = (320, 320)        # Resolución visual (reducida de 500x500 para menor peso)
+JPEG_QUALITY = 40        # Calidad JPEG (1 a 100). Reducirla alivia la CPU y la red
+STREAM_SIZE = (320, 320) # Resolución de la transmisión (320x320 en lugar de 500x500)
+STREAM_FPS_SLEEP = 0.066 # ~15 FPS en la transmisión web (1 / 15 = 0.066s)
 
 latest_frame = None
 frame_lock = threading.Lock()
@@ -56,11 +55,9 @@ def camara_reader():
     global latest_frame
     
     ser = conectar_camara()
-    
     buffer = bytearray()
     total_bytes = 0
     frames_count = 0
-    last_process_time = 0.0
 
     while True:
         try:
@@ -93,12 +90,6 @@ def camara_reader():
                     packet = buffer[:packet_size]
                     buffer = buffer[packet_size:]
                     
-                    # Control de FPS: Descartar el procesamiento si no ha transcurrido el tiempo necesario
-                    now = time.time()
-                    if (now - last_process_time) < FRAME_INTERVAL:
-                        continue
-                    last_process_time = now
-
                     cols = packet[14] if len(packet) > 14 and packet[14] > 0 else 100
                     rows = packet[15] if len(packet) > 15 and packet[15] > 0 else 100
                     
@@ -110,11 +101,11 @@ def camara_reader():
                         raw_img = np.array(img_bytes, dtype=np.uint8).reshape((rows, cols))
                         raw_img = cv2.flip(raw_img, 1)
                         
-                        # 1. Reducción de resolución visual
+                        # Resizes y compresión optimizada
                         big_img = cv2.resize(raw_img, STREAM_SIZE, interpolation=cv2.INTER_NEAREST)
                         color_img = cv2.applyColorMap(big_img, cv2.COLORMAP_JET)
                         
-                        # 2. Reducción de Calidad JPEG (Parámetro IMWRITE_JPEG_QUALITY)
+                        # Parámetros para reducir la calidad de imagen JPEG
                         encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY]
                         _, jpeg = cv2.imencode('.jpg', color_img, encode_param)
                         
@@ -122,7 +113,7 @@ def camara_reader():
                             latest_frame = jpeg.tobytes()
                             
                         frames_count += 1
-                        print(f"📷 [STREAM ACTIVO] Frame #{frames_count} ({cols}x{rows}px) | FPS: ~15 | Bytes: {total_bytes}  ", end="\r")
+                        print(f"📷 [STREAM ACTIVO] Frame #{frames_count} ({cols}x{rows}px) | Bytes: {total_bytes}  ", end="\r")
 
         except Exception as e:
             print(f"\n\n[❌] Desconexión detectada o Error I/O: {e}")
@@ -148,7 +139,7 @@ class StreamingHandler(BaseHTTPRequestHandler):
             <html>
             <head><title>Radxa ToF Stream</title></head>
             <body style="background:#1e1e2e; color:#cdd6f4; font-family:sans-serif; display:flex; flex-direction:column; align-items:center; justify-content:center; height:100vh; margin:0;">
-                <h2>Stream ToF (Sipeed A010) - 15 FPS</h2>
+                <h2>Stream ToF (Sipeed A010)</h2>
                 <div style="border: 4px solid #45475a; border-radius: 12px; overflow: hidden;">
                     <img src="/stream" width="{STREAM_SIZE[0]}" height="{STREAM_SIZE[1]}" />
                 </div>
@@ -177,8 +168,8 @@ class StreamingHandler(BaseHTTPRequestHandler):
                         self.wfile.write(frame)
                         self.wfile.write(b'\r\n')
                     
-                    # 3. Dormir el tiempo equivalente a 15 FPS en la transmisión HTTP (~0.066s)
-                    time.sleep(FRAME_INTERVAL)
+                    # Control de refresco en la web (15 FPS max)
+                    time.sleep(STREAM_FPS_SLEEP)
             except Exception:
                 pass
         else:
