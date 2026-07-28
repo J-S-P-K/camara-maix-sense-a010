@@ -8,7 +8,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 # ──────────────────────────────────────────────────────────────────────────────
 # CONFIGURACIÓN
 # ──────────────────────────────────────────────────────────────────────────────
-PORT   = "/dev/ttyUSB0"   # cambiá a USB1 si no funciona
+PORT   = "/dev/ttyUSB2"   # cambiá a USB1 si no funciona
 BAUD   = 115200
 HEADER = b'\x00\xFF'
 
