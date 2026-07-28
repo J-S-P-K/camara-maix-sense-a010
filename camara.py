@@ -6,7 +6,8 @@ import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 PORT = "/dev/ttyUSB0"
-BAUD = 115200
+# 921600 es la velocidad oficial de la Sipeed A010 para streaming de imagen
+BAUD = 921600
 HEADER = b'\x00\xFF'
 
 latest_frame = None
@@ -15,30 +16,42 @@ frame_lock = threading.Lock()
 def camara_reader():
     global latest_frame
 
-    print(f"[Serial] Abriendo puerto {PORT} a {BAUD} baudios de forma limpia...")
+    print(f"[Serial] Intentando conectar a {PORT} a {BAUD} baudios...")
     try:
         ser = serial.Serial(PORT, BAUD, timeout=1)
         ser.reset_input_buffer()
         ser.reset_output_buffer()
     except Exception as e:
-        print(f"❌ [Serial ERROR] No se pudo abrir el puerto: {e}")
-        return
+        print(f"❌ [Serial ERROR] No se pudo abrir a {BAUD}: {e}")
+        print("[Serial] Reintentando a 115200 por seguridad...")
+        try:
+            ser = serial.Serial(PORT, 115200, timeout=1)
+        except Exception as e2:
+            print(f"❌ [Serial ERROR] Tampoco se pudo abrir a 115200: {e2}")
+            return
 
-    # Comandos de inicialización seguros para el chip ToF
-    comandos = [b"AT+ISP=1\r\n", b"AT+DISP=2\r\n", b"AT+UNIT=2\r\n", b"AT+BINN=1\r\n"]
+    # Enviamos la secuencia de comandos para despertar el streaming
+    print("[Serial] Enviando comandos de inicio a la cámara...")
+    comandos = [b"AT+ISP=1\r\n", b"AT+DISP=3\r\n", b"AT+UNIT=2\r\n", b"AT+BINN=1\r\n"]
     for cmd in comandos:
         ser.write(cmd)
         time.sleep(0.1)
 
     ser.reset_input_buffer()
-    print("[Serial] Puerto iniciado correctamente. Esperando stream de imágenes...")
     buffer = bytearray()
+    
+    last_debug_time = time.time()
+    total_bytes_received = 0
 
     while True:
         try:
-            if ser.in_waiting > 0:
-                buffer += ser.read(ser.in_waiting)
+            waiting = ser.in_waiting
+            if waiting > 0:
+                chunk = ser.read(waiting)
+                buffer += chunk
+                total_bytes_received += len(chunk)
                 
+                # Procesamiento del buffer de imágenes
                 while len(buffer) >= 4:
                     idx = buffer.find(HEADER)
                     if idx == -1:
@@ -82,9 +95,15 @@ def camara_reader():
                         with frame_lock:
                             latest_frame = jpeg.tobytes()
                             
-                        print("📷 [OK] Frame capturado y listo para la web", end="\r")
+                        print(f"📷 [OK] Frame capturado! ({cols}x{rows} px) | Total RX: {total_bytes_received} bytes", end="\r")
+
+            # Muestra de vida cada 2 segundos si no hay frames completos
+            if time.time() - last_debug_time > 2.0:
+                print(f"[Diagnóstico] Estado del puerto: Leyendo... | Total acumulado: {total_bytes_received} bytes en buffer")
+                last_debug_time = time.time()
+
         except Exception as e:
-            print(f"\n⚠️ [Serial] Error de lectura: {e}")
+            print(f"\n⚠️ [Serial] Error en lectura: {e}")
             time.sleep(0.5)
             
         time.sleep(0.001)
