@@ -8,8 +8,6 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 PORT = "/dev/ttyUSB0"
 BAUD = 115200
 HEADER = b'\x00\xFF'
-TARGET_FPS = 8
-FRAME_INTERVAL = 1.0 / TARGET_FPS  # 0.125 segundos para 8 FPS
 
 latest_frame = None
 frame_lock = threading.Lock()
@@ -39,7 +37,6 @@ def camara_reader():
     buffer = bytearray()
     total_bytes = 0
     frames_count = 0
-    last_process_time = 0
 
     while True:
         try:
@@ -49,11 +46,6 @@ def camara_reader():
                 buffer += chunk
                 total_bytes += len(chunk)
                 
-                # Evita que el buffer crezca indefinidamente si los datos se corrompen
-                if len(buffer) > 30000:
-                    buffer.clear()
-                    continue
-
                 while len(buffer) >= 4:
                     idx = buffer.find(HEADER)
                     if idx == -1:
@@ -77,12 +69,8 @@ def camara_reader():
                     packet = buffer[:packet_size]
                     buffer = buffer[packet_size:]
                     
-                    # Limitar procesamiento a la tasa objetivo (8 FPS) para no saturar CPU
-                    current_time = time.time()
-                    if current_time - last_process_time < FRAME_INTERVAL:
-                        continue
-                    last_process_time = current_time
-
+                    # ── RESOLUCIÓN Y LECTURA DE IMAGEN ────────────────────────
+                    # La resolución (100x100) está en los índices 14 y 15 del paquete
                     cols = packet[14] if len(packet) > 14 and packet[14] > 0 else 100
                     rows = packet[15] if len(packet) > 15 and packet[15] > 0 else 100
                     
@@ -92,7 +80,7 @@ def camara_reader():
                     if len(packet) >= img_end:
                         img_bytes = packet[img_start:img_end]
                         raw_img = np.array(img_bytes, dtype=np.uint8).reshape((rows, cols))
-                        raw_img = cv2.flip(raw_img, 1)
+                        raw_img = cv2.flip(raw_img, 1) # Espejo
                         
                         big_img = cv2.resize(raw_img, (500, 500), interpolation=cv2.INTER_NEAREST)
                         color_img = cv2.applyColorMap(big_img, cv2.COLORMAP_JET)
@@ -103,13 +91,13 @@ def camara_reader():
                             latest_frame = jpeg.tobytes()
                             
                         frames_count += 1
-                        print(f"📷 [STREAM ACTIVO] Frame #{frames_count} ({cols}x{rows}px) | 8 FPS ", end="\r")
+                        print(f"📷 [STREAM ACTIVO] Frame #{frames_count} ({cols}x{rows}px) | Total: {total_bytes} bytes  ", end="\r")
 
         except Exception as e:
             print(f"\n[⚠️] Excepción en lectura serial: {e}")
             time.sleep(0.2)
             
-        time.sleep(0.005)
+        time.sleep(0.001)
 
 class StreamingHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -122,7 +110,7 @@ class StreamingHandler(BaseHTTPRequestHandler):
             <html>
             <head><title>Radxa ToF Stream</title></head>
             <body style="background:#1e1e2e; color:#cdd6f4; font-family:sans-serif; display:flex; flex-direction:column; align-items:center; justify-content:center; height:100vh; margin:0;">
-                <h2>Stream ToF (Sipeed A010) - 8 FPS</h2>
+                <h2>Stream ToF (Sipeed A010)</h2>
                 <div style="border: 4px solid #45475a; border-radius: 12px; overflow: hidden;">
                     <img src="/stream" width="500" height="500" />
                 </div>
@@ -151,8 +139,7 @@ class StreamingHandler(BaseHTTPRequestHandler):
                         self.wfile.write(frame)
                         self.wfile.write(b'\r\n')
                     
-                    # Sincronizado a 8 FPS (0.125s por imagen)
-                    time.sleep(FRAME_INTERVAL)
+                    time.sleep(0.125)
             except Exception:
                 pass
         else:
