@@ -124,7 +124,7 @@ class StreamingHandler(BaseHTTPRequestHandler):
             </html>
             """
             self.wfile.write(html.encode('utf-8'))
-            
+
         elif self.path == '/stream':
             self.send_response(200)
             self.send_header('Age', '0')
@@ -132,12 +132,15 @@ class StreamingHandler(BaseHTTPRequestHandler):
             self.send_header('Pragma', 'no-cache')
             self.send_header('Content-Type', 'multipart/x-mixed-replace; boundary=frame')
             self.end_headers()
+            last_sent = None
             try:
                 while True:
                     with frame_lock:
                         frame = latest_frame
                     
-                    if frame is not None:
+                    # Solo enviar si el frame cambió respecto al anterior
+                    if frame is not None and frame != last_sent:
+                        last_sent = frame
                         self.wfile.write(b'--frame\r\n')
                         self.send_header('Content-Type', 'image/jpeg')
                         self.send_header('Content-Length', str(len(frame)))
@@ -145,9 +148,10 @@ class StreamingHandler(BaseHTTPRequestHandler):
                         self.wfile.write(frame)
                         self.wfile.write(b'\r\n')
                     
-                    time.sleep(0.125)
+                    time.sleep(0.05) # Pausa segura (20 FPS de chequeo sin saturar el hilo)
             except Exception:
                 pass
+        
         else:
             self.send_error(404)
 
