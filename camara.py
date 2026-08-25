@@ -3,52 +3,57 @@ import time
 import cv2
 import numpy as np
 import threading
-import glob
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
+PORT = "/dev/ttyUSB0"
 BAUD = 115200
 HEADER = b'\x00\xFF'
-INTERVALO_FOTO = 1.0  # 1 foto cada 1.0 segundo
-JPEG_QUALITY = 40     # Calidad de imagen baja para menor uso de CPU
-STREAM_SIZE = (320, 320)
+TARGET_FPS = 8
+FRAME_INTERVAL = 1.0 / TARGET_FPS  # 0.125 segundos para 8 FPS
 
 latest_frame = None
 frame_lock = threading.Lock()
 
-def conectar_camara():
-    """Busca y conecta la cámara USB"""
-    while True:
-        puertos = sorted(glob.glob('/dev/ttyUSB*'))
-        if puertos:
-            puerto = puertos[0]
-            try:
-                ser = serial.Serial(puerto, BAUD, timeout=1)
-                ser.reset_input_buffer()
-                # Comandos de inicialización AT
-                for cmd in [b"AT+ISP=1\r\n", b"AT+DISP=2\r\n", b"AT+UNIT=2\r\n", b"AT+BINN=1\r\n"]:
-                    ser.write(cmd)
-                    time.sleep(0.1)
-                ser.reset_input_buffer()
-                print(f"[✅] Cámara lista en {puerto}")
-                return ser
-            except Exception as e:
-                print(f"[⚠️] Error al conectar en {puerto}: {e}")
-        else:
-            print("[🔍] Buscando cámara USB...", end="\r")
-        time.sleep(2)
-
 def camara_reader():
     global latest_frame
-    ser = conectar_camara()
+
+    print(f"\n[1/4] Abriendo puerto {PORT} a {BAUD} baudios...")
+    try:
+        ser = serial.Serial(PORT, BAUD, timeout=1)
+        ser.reset_input_buffer()
+        ser.reset_output_buffer()
+        print("[✅] Conexión USB establecida.")
+    except Exception as e:
+        print(f"[❌] Error al abrir el puerto: {e}")
+        return
+
+    print("[2/4] Enviando comandos de inicialización...")
+    comandos = [b"AT+ISP=1\r\n", b"AT+DISP=2\r\n", b"AT+UNIT=2\r\n", b"AT+BINN=1\r\n"]
+    for cmd in comandos:
+        ser.write(cmd)
+        time.sleep(0.1)
+
+    ser.reset_input_buffer()
+    print("[3/4] Procesando flujo de imagen ToF...")
+    
     buffer = bytearray()
-    last_capture = 0
-    fotos_count = 0
+    total_bytes = 0
+    frames_count = 0
+    last_process_time = 0
 
     while True:
         try:
-            if ser.in_waiting > 0:
-                buffer += ser.read(ser.in_waiting)
+            waiting = ser.in_waiting
+            if waiting > 0:
+                chunk = ser.read(waiting)
+                buffer += chunk
+                total_bytes += len(chunk)
                 
+                # Evita que el buffer crezca indefinidamente si los datos se corrompen
+                if len(buffer) > 30000:
+                    buffer.clear()
+                    continue
+
                 while len(buffer) >= 4:
                     idx = buffer.find(HEADER)
                     if idx == -1:
@@ -72,58 +77,65 @@ def camara_reader():
                     packet = buffer[:packet_size]
                     buffer = buffer[packet_size:]
                     
-                    # Solo procesamos la imagen si ya pasó 1 segundo desde la última
-                    now = time.time()
-                    if now - last_capture >= INTERVALO_FOTO:
-                        last_capture = now
+                    # Limitar procesamiento a la tasa objetivo (8 FPS) para no saturar CPU
+                    current_time = time.time()
+                    if current_time - last_process_time < FRAME_INTERVAL:
+                        continue
+                    last_process_time = current_time
+
+                    cols = packet[14] if len(packet) > 14 and packet[14] > 0 else 100
+                    rows = packet[15] if len(packet) > 15 and packet[15] > 0 else 100
+                    
+                    img_start = 20
+                    img_end = img_start + (rows * cols)
+                    
+                    if len(packet) >= img_end:
+                        img_bytes = packet[img_start:img_end]
+                        raw_img = np.array(img_bytes, dtype=np.uint8).reshape((rows, cols))
+                        raw_img = cv2.flip(raw_img, 1)
                         
-                        cols = packet[14] if len(packet) > 14 and packet[14] > 0 else 100
-                        rows = packet[15] if len(packet) > 15 and packet[15] > 0 else 100
-                        img_start = 20
-                        img_end = img_start + (rows * cols)
+                        big_img = cv2.resize(raw_img, (500, 500), interpolation=cv2.INTER_NEAREST)
+                        color_img = cv2.applyColorMap(big_img, cv2.COLORMAP_JET)
                         
-                        if len(packet) >= img_end:
-                            img_bytes = packet[img_start:img_end]
-                            raw_img = np.array(img_bytes, dtype=np.uint8).reshape((rows, cols))
-                            raw_img = cv2.flip(raw_img, 1)
+                        _, jpeg = cv2.imencode('.jpg', color_img)
+                        
+                        with frame_lock:
+                            latest_frame = jpeg.tobytes()
                             
-                            big_img = cv2.resize(raw_img, STREAM_SIZE, interpolation=cv2.INTER_NEAREST)
-                            color_img = cv2.applyColorMap(big_img, cv2.COLORMAP_JET)
-                            
-                            _, jpeg = cv2.imencode('.jpg', color_img, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
-                            
-                            with frame_lock:
-                                latest_frame = jpeg.tobytes()
-                                
-                            fotos_count += 1
-                            print(f"[📷] Foto #{fotos_count} capturada y enviada", end="\r")
+                        frames_count += 1
+                        print(f"📷 [STREAM ACTIVO] Frame #{frames_count} ({cols}x{rows}px) | 8 FPS ", end="\r")
 
         except Exception as e:
-            print(f"\n[❌] Desconexión: {e}. Reconectando...")
-            try:
-                ser.close()
-            except:
-                pass
-            time.sleep(1)
-            ser = conectar_camara()
-            buffer = bytearray()
+            print(f"\n[⚠️] Excepción en lectura serial: {e}")
+            time.sleep(0.2)
             
-        time.sleep(0.01)
+        time.sleep(0.005)
 
 class StreamingHandler(BaseHTTPRequestHandler):
     def do_GET(self):
+        global latest_frame
         if self.path == '/':
             self.send_response(200)
             self.send_header('Content-type', 'text/html')
             self.end_headers()
-            html = f"""<html><body style="background:#111; color:#fff; text-align:center; font-family:sans-serif;">
-                <h2>ToF Stream (1 foto/seg)</h2>
-                <img src="/stream" width="{STREAM_SIZE[0]}" height="{STREAM_SIZE[1]}" />
-            </body></html>"""
+            html = """
+            <html>
+            <head><title>Radxa ToF Stream</title></head>
+            <body style="background:#1e1e2e; color:#cdd6f4; font-family:sans-serif; display:flex; flex-direction:column; align-items:center; justify-content:center; height:100vh; margin:0;">
+                <h2>Stream ToF (Sipeed A010) - 8 FPS</h2>
+                <div style="border: 4px solid #45475a; border-radius: 12px; overflow: hidden;">
+                    <img src="/stream" width="500" height="500" />
+                </div>
+            </body>
+            </html>
+            """
             self.wfile.write(html.encode('utf-8'))
             
         elif self.path == '/stream':
             self.send_response(200)
+            self.send_header('Age', '0')
+            self.send_header('Cache-Control', 'no-cache, private')
+            self.send_header('Pragma', 'no-cache')
             self.send_header('Content-Type', 'multipart/x-mixed-replace; boundary=frame')
             self.end_headers()
             try:
@@ -132,21 +144,33 @@ class StreamingHandler(BaseHTTPRequestHandler):
                         frame = latest_frame
                     
                     if frame is not None:
-                        self.wfile.write(b'--frame\r\nContent-Type: image/jpeg\r\nContent-Length: ' + str(len(frame)).encode() + b'\r\n\r\n' + frame + b'\r\n')
+                        self.wfile.write(b'--frame\r\n')
+                        self.send_header('Content-Type', 'image/jpeg')
+                        self.send_header('Content-Length', str(len(frame)))
+                        self.end_headers()
+                        self.wfile.write(frame)
+                        self.wfile.write(b'\r\n')
                     
-                    time.sleep(INTERVALO_FOTO) # Envía 1 foto cada segundo
+                    # Sincronizado a 8 FPS (0.125s por imagen)
+                    time.sleep(FRAME_INTERVAL)
             except Exception:
                 pass
         else:
             self.send_error(404)
 
     def log_message(self, format, *args):
-        return # Desactiva logs molestos de HTTP en consola
+        return
+
+def run_server():
+    server = HTTPServer(('0.0.0.0', 8085), StreamingHandler)
+    print("\n[4/4] 🌍 Servidor Web Activo!")
+    print("      👉 Ingresá en tu navegador a: http://<IP-DE-LA-RADXA>:8085\n")
+    server.serve_forever()
 
 if __name__ == '__main__':
-    threading.Thread(target=camara_reader, daemon=True).start()
-    print("[🌍] Servidor activo en http://0.0.0.0:8085")
+    thr = threading.Thread(target=camara_reader, daemon=True)
+    thr.start()
     try:
-        HTTPServer(('0.0.0.0', 8085), StreamingHandler).serve_forever()
+        run_server()
     except KeyboardInterrupt:
         print("\n👋 Cerrando...")
