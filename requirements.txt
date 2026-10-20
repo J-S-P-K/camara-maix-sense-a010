@@ -1,3 +1,4 @@
 pyserial
 numpy
 opencv-python
+ai-edge-litert
