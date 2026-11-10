@@ -48,7 +48,8 @@ def crear_modelo():
         tf.keras.layers.MaxPooling2D(),
         tf.keras.layers.Conv2D(32, 3, activation="relu", padding="same"),
         tf.keras.layers.MaxPooling2D(),
-        tf.keras.layers.GlobalAveragePooling2D(),
+        tf.keras.layers.Flatten(),
+        tf.keras.layers.Dense(32, activation="relu"),
         tf.keras.layers.Dropout(0.3),
         tf.keras.layers.Dense(1, activation="sigmoid"),  # probabilidad de "lleno"
     ])
@@ -70,15 +71,15 @@ def main():
     x_train, y_train, x_val, y_val = x[:corte], y[:corte], x[corte:], y[corte:]
 
     train = (tf.data.Dataset.from_tensor_slices((x_train, y_train))
-             .shuffle(len(x_train)).map(aumentar).batch(32))
-    val = tf.data.Dataset.from_tensor_slices((x_val, y_val)).batch(32)
+             .shuffle(len(x_train)).map(aumentar).batch(16))
+    val = tf.data.Dataset.from_tensor_slices((x_val, y_val)).batch(16)
 
     print("[2/4] Entrenando la red neuronal...")
     modelo = crear_modelo()
     modelo.compile(optimizer="adam", loss="binary_crossentropy", metrics=["accuracy"])
     modelo.summary()
     modelo.fit(train, validation_data=val, epochs=args.epocas, callbacks=[
-        tf.keras.callbacks.EarlyStopping(patience=5, restore_best_weights=True),
+        tf.keras.callbacks.EarlyStopping(patience=10, restore_best_weights=True),
     ])
 
     print("[3/4] Evaluando...")
