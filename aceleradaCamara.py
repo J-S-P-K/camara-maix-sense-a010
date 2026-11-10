@@ -5,8 +5,10 @@ import numpy as np
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-# Activar aceleración OpenCL en GPU
-cv2.ocl.setUseOpenCL(True)
+# Misma base que camara.py (el stream que funciona). El único agregado es que
+# el espejado, el resize y el coloreado se intentan hacer en la GPU (OpenCL/UMat).
+# Si la GPU falla o no está disponible, se pasa automáticamente a la CPU
+# y el stream sigue andando exactamente como camara.py.
 
 PORT = "/dev/ttyUSB0"
 BAUD = 115200
@@ -14,6 +16,28 @@ HEADER = b'\x00\xFF'
 
 latest_frame = None
 frame_lock = threading.Lock()
+
+# Activar aceleración OpenCL en GPU (si OpenCV la tiene disponible)
+cv2.ocl.setUseOpenCL(True)
+usar_gpu = cv2.ocl.haveOpenCL() and cv2.ocl.useOpenCL()
+print(f"[GPU] OpenCL {'disponible: se procesa en GPU' if usar_gpu else 'NO disponible: se procesa en CPU'}")
+
+def procesar_imagen(raw_img):
+    """Espejo + resize + color. En GPU si se puede, si no en CPU."""
+    global usar_gpu
+    if usar_gpu:
+        try:
+            raw_gpu = cv2.UMat(raw_img)
+            raw_gpu = cv2.flip(raw_gpu, 1) # Espejo
+            big_img = cv2.resize(raw_gpu, (500, 500), interpolation=cv2.INTER_NEAREST)
+            color_img = cv2.applyColorMap(big_img, cv2.COLORMAP_JET)
+            return color_img.get()  # vuelve a memoria normal para codificar el JPEG
+        except Exception as e:
+            usar_gpu = False
+            print(f"\n[⚠️] Falló el procesamiento en GPU ({e}). Se sigue en CPU.")
+    raw_img = cv2.flip(raw_img, 1) # Espejo
+    big_img = cv2.resize(raw_img, (500, 500), interpolation=cv2.INTER_NEAREST)
+    return cv2.applyColorMap(big_img, cv2.COLORMAP_JET)
 
 def camara_reader():
     global latest_frame
@@ -72,7 +96,7 @@ def camara_reader():
                     packet = buffer[:packet_size]
                     buffer = buffer[packet_size:]
                     
-                    # ── RESOLUCIÓN Y LECTURA DE IMAGEN ────────────────────────
+                    # La resolución (100x100) está en los índices 14 y 15 del paquete
                     cols = packet[14] if len(packet) > 14 and packet[14] > 0 else 100
                     rows = packet[15] if len(packet) > 15 and packet[15] > 0 else 100
                     
@@ -83,21 +107,14 @@ def camara_reader():
                         img_bytes = packet[img_start:img_end]
                         raw_img = np.array(img_bytes, dtype=np.uint8).reshape((rows, cols))
                         
-                        # Carga en GPU
-                        raw_gpu = cv2.UMat(raw_img)
-                        
-                        # Procesamiento directo en GPU Adreno
-                        raw_gpu = cv2.flip(raw_gpu, 1) # Espejo
-                        big_img = cv2.resize(raw_gpu, (500, 500), interpolation=cv2.INTER_NEAREST)
-                        color_img = cv2.applyColorMap(big_img, cv2.COLORMAP_JET)
-                        
+                        color_img = procesar_imagen(raw_img)
                         _, jpeg = cv2.imencode('.jpg', color_img)
                         
                         with frame_lock:
                             latest_frame = jpeg.tobytes()
                             
                         frames_count += 1
-                        print(f"📷 [STREAM ACTIVO] Frame #{frames_count} ({cols}x{rows}px) | Total: {total_bytes} bytes  ", end="\r")
+                        print(f"📷 [STREAM ACTIVO] Frame #{frames_count} ({cols}x{rows}px) | {'GPU' if usar_gpu else 'CPU'} | Total: {total_bytes} bytes  ", end="\r")
 
         except Exception as e:
             print(f"\n[⚠️] Excepción en lectura serial: {e}")
@@ -132,15 +149,12 @@ class StreamingHandler(BaseHTTPRequestHandler):
             self.send_header('Pragma', 'no-cache')
             self.send_header('Content-Type', 'multipart/x-mixed-replace; boundary=frame')
             self.end_headers()
-            last_sent = None
             try:
                 while True:
                     with frame_lock:
                         frame = latest_frame
                     
-                    # Solo enviar si el frame cambió respecto al anterior
-                    if frame is not None and frame != last_sent:
-                        last_sent = frame
+                    if frame is not None:
                         self.wfile.write(b'--frame\r\n')
                         self.send_header('Content-Type', 'image/jpeg')
                         self.send_header('Content-Length', str(len(frame)))
@@ -148,10 +162,9 @@ class StreamingHandler(BaseHTTPRequestHandler):
                         self.wfile.write(frame)
                         self.wfile.write(b'\r\n')
                     
-                    time.sleep(0.05) # Pausa segura (20 FPS de chequeo sin saturar el hilo)
+                    time.sleep(0.125)
             except Exception:
                 pass
-        
         else:
             self.send_error(404)
 

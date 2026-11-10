@@ -4,56 +4,62 @@ import cv2
 import numpy as np
 import threading
 import glob
+import os
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
+# Misma base que camara.py (el stream que funciona), con dos agregados:
+#   1. Si /dev/ttyUSB0 no existe, busca otro /dev/ttyUSB*.
+#   2. Si la cámara se desenchufa, espera y se vuelve a conectar sola.
+# Todo lo demás (comandos AT, lectura de paquetes, servidor web) es idéntico a camara.py.
+
+PORT = "/dev/ttyUSB0"
 BAUD = 115200
 HEADER = b'\x00\xFF'
 
 # --- CONFIGURACIÓN DE RENDIMIENTO Y CALIDAD ---
 JPEG_QUALITY = 40        # Calidad JPEG (1 a 100). Reducirla alivia la CPU y la red
 STREAM_SIZE = (320, 320) # Resolución de la transmisión (320x320 en lugar de 500x500)
-STREAM_FPS_SLEEP = 0.066 # ~15 FPS en la transmisión web (1 / 15 = 0.066s)
 
 latest_frame = None
 frame_lock = threading.Lock()
 
 def encontrar_puerto_usb():
-    """Busca cualquier puerto ttyUSB disponible (/dev/ttyUSB0, /dev/ttyUSB1, etc.)"""
-    puertos = glob.glob('/dev/ttyUSB*')
-    if puertos:
-        return sorted(puertos)[0]
-    return None
+    """Usa PORT si existe; si no, el primer /dev/ttyUSB* que encuentre."""
+    if os.path.exists(PORT):
+        return PORT
+    puertos = sorted(glob.glob('/dev/ttyUSB*'))
+    return puertos[0] if puertos else None
 
 def conectar_camara():
-    """Intenta abrir la cámara y reconfigurarla con comandos AT"""
+    """Abre la cámara y manda los comandos AT igual que camara.py. Reintenta hasta lograrlo."""
     while True:
         puerto = encontrar_puerto_usb()
         if puerto:
             try:
-                print(f"\n[🔌] Intentando conectar en {puerto}...")
+                print(f"\n[1/4] Abriendo puerto {puerto} a {BAUD} baudios...")
                 ser = serial.Serial(puerto, BAUD, timeout=1)
                 ser.reset_input_buffer()
                 ser.reset_output_buffer()
-                
-                # Enviar comandos de inicialización
+                print("[✅] Conexión USB establecida.")
+
+                print("[2/4] Enviando comandos de inicialización...")
                 comandos = [b"AT+ISP=1\r\n", b"AT+DISP=2\r\n", b"AT+UNIT=2\r\n", b"AT+BINN=1\r\n"]
                 for cmd in comandos:
                     ser.write(cmd)
                     time.sleep(0.1)
-                
+
                 ser.reset_input_buffer()
-                print(f"[✅] ¡Conectado con éxito en {puerto}!")
+                print("[3/4] Procesando flujo de imagen ToF...")
                 return ser
             except Exception as e:
-                print(f"[⚠️] No se pudo abrir {puerto}: {e}")
+                print(f"[❌] Error al abrir el puerto {puerto}: {e}")
         else:
-            print("[🔍] Buscando cámara USB... (asegúrate de que esté enchufada)", end="\r")
-        
+            print("[🔍] Buscando cámara USB... (asegurate de que esté enchufada)", end="\r")
         time.sleep(2)
 
 def camara_reader():
     global latest_frame
-    
+
     ser = conectar_camara()
     buffer = bytearray()
     total_bytes = 0
@@ -90,6 +96,7 @@ def camara_reader():
                     packet = buffer[:packet_size]
                     buffer = buffer[packet_size:]
                     
+                    # La resolución (100x100) está en los índices 14 y 15 del paquete
                     cols = packet[14] if len(packet) > 14 and packet[14] > 0 else 100
                     rows = packet[15] if len(packet) > 15 and packet[15] > 0 else 100
                     
@@ -99,13 +106,11 @@ def camara_reader():
                     if len(packet) >= img_end:
                         img_bytes = packet[img_start:img_end]
                         raw_img = np.array(img_bytes, dtype=np.uint8).reshape((rows, cols))
-                        raw_img = cv2.flip(raw_img, 1)
+                        raw_img = cv2.flip(raw_img, 1) # Espejo
                         
-                        # Resizes y compresión optimizada
                         big_img = cv2.resize(raw_img, STREAM_SIZE, interpolation=cv2.INTER_NEAREST)
                         color_img = cv2.applyColorMap(big_img, cv2.COLORMAP_JET)
                         
-                        # Parámetros para reducir la calidad de imagen JPEG
                         encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY]
                         _, jpeg = cv2.imencode('.jpg', color_img, encode_param)
                         
@@ -113,18 +118,23 @@ def camara_reader():
                             latest_frame = jpeg.tobytes()
                             
                         frames_count += 1
-                        print(f"📷 [STREAM ACTIVO] Frame #{frames_count} ({cols}x{rows}px) | Bytes: {total_bytes}  ", end="\r")
+                        print(f"📷 [STREAM ACTIVO] Frame #{frames_count} ({cols}x{rows}px) | Total: {total_bytes} bytes  ", end="\r")
 
-        except Exception as e:
-            print(f"\n\n[❌] Desconexión detectada o Error I/O: {e}")
-            print("[🔄] Reiniciando puerto y reconectando...")
+        except (serial.SerialException, OSError) as e:
+            # Solo acá reconectamos: el puerto se cerró o la cámara se desenchufó
+            print(f"\n[❌] Desconexión detectada: {e}")
+            print("[🔄] Reconectando...")
             try:
                 ser.close()
-            except:
+            except Exception:
                 pass
             time.sleep(1)
             ser = conectar_camara()
             buffer = bytearray()
+        except Exception as e:
+            # Cualquier otro error se ignora y se sigue leyendo, igual que camara.py
+            print(f"\n[⚠️] Excepción en lectura serial: {e}")
+            time.sleep(0.2)
             
         time.sleep(0.001)
 
@@ -168,8 +178,7 @@ class StreamingHandler(BaseHTTPRequestHandler):
                         self.wfile.write(frame)
                         self.wfile.write(b'\r\n')
                     
-                    # Control de refresco en la web (15 FPS max)
-                    time.sleep(STREAM_FPS_SLEEP)
+                    time.sleep(0.125)
             except Exception:
                 pass
         else:
@@ -180,7 +189,8 @@ class StreamingHandler(BaseHTTPRequestHandler):
 
 def run_server():
     server = HTTPServer(('0.0.0.0', 8085), StreamingHandler)
-    print("\n[🌍] Servidor Web Activo en el puerto 8085")
+    print("\n[4/4] 🌍 Servidor Web Activo!")
+    print("      👉 Ingresá en tu navegador a: http://<IP-DE-LA-RADXA>:8085\n")
     server.serve_forever()
 
 if __name__ == '__main__':
