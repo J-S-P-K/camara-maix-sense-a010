@@ -1,10 +1,16 @@
 """Monitorea el almacenamiento de la maqueta con la cámara ToF y una red neuronal (TFLite).
 Si la IA detecta el almacenamiento lleno durante TIEMPO_ALERTA segundos seguidos,
 manda una alerta por la terminal. También muestra el stream en http://<IP>:8085
+
+La lectura de la cámara y el servidor web son los mismos de camara.py (el stream
+que funciona); lo único que se agrega es la clasificación con la IA.
+Si todavía no existe el modelo .tflite, el stream igual se muestra (sin IA).
 """
+import os
 import threading
 import time
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import traceback
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import cv2
 import numpy as np
@@ -55,6 +61,22 @@ class ClasificadorAlmacenamiento:
         return float(y.ravel()[0])
 
 
+def cargar_clasificador():
+    """Devuelve el clasificador, o None (con un mensaje claro) si no se puede usar la IA."""
+    if not os.path.exists(MODELO):
+        print(f"[⚠️] No se encontró '{MODELO}'. El stream va a funcionar SIN IA.")
+        print("     Para generarlo: capturarDataset.py (vacio/lleno) -> entrenarModelo.py -> copiar el .tflite acá.")
+        return None
+    try:
+        clasificador = ClasificadorAlmacenamiento(MODELO)
+        print(f"[🤖] Modelo '{MODELO}' cargado. IA activa.")
+        return clasificador
+    except Exception as e:
+        print(f"[⚠️] No se pudo cargar la IA ({e}). El stream va a funcionar SIN IA.")
+        print("     Instalá el intérprete con: pip install ai-edge-litert  (o tflite-runtime)")
+        return None
+
+
 class MonitorLlenado:
     """Lleva la cuenta de cuánto tiempo seguido está lleno el almacenamiento."""
 
@@ -81,14 +103,13 @@ class MonitorLlenado:
         return 0.0 if self.lleno_desde is None else ahora - self.lleno_desde
 
 
-def dibujar(img, prob, lleno, segundos):
+def dibujar(img, texto):
     big = cv2.resize(img, STREAM_SIZE, interpolation=cv2.INTER_NEAREST)
     color = cv2.applyColorMap(big, cv2.COLORMAP_JET)
     fx = STREAM_SIZE[0] / img.shape[1]
     fy = STREAM_SIZE[1] / img.shape[0]
     x1, y1, x2, y2 = ZONA
     cv2.rectangle(color, (int(x1 * fx), int(y1 * fy)), (int(x2 * fx) - 1, int(y2 * fy) - 1), (0, 255, 0), 2)
-    texto = f"{'LLENO' if lleno else 'VACIO'} {prob * 100:.0f}%  {segundos:.0f}/{TIEMPO_ALERTA}s"
     cv2.putText(color, texto, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 4)
     cv2.putText(color, texto, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
     return color
@@ -96,34 +117,47 @@ def dibujar(img, prob, lleno, segundos):
 
 def monitorear():
     global latest_frame
-    clasificador = ClasificadorAlmacenamiento(MODELO)
+    clasificador = cargar_clasificador()
     monitor = MonitorLlenado(TIEMPO_ALERTA)
     prob_suave = 0.0
+    frames_count = 0
 
     for img in leer_frames():
-        prob = clasificador.probabilidad_lleno(img)
-        prob_suave = SUAVIZADO * prob + (1 - SUAVIZADO) * prob_suave
-        lleno = prob_suave >= UMBRAL_CONFIANZA
-        ahora = time.monotonic()
+        try:
+            frames_count += 1
+            if clasificador is None:
+                texto = "SIN MODELO (solo camara)"
+                print(f"📷 [STREAM ACTIVO] Frame #{frames_count} | sin IA   ", end="\r")
+            else:
+                prob = clasificador.probabilidad_lleno(img)
+                prob_suave = SUAVIZADO * prob + (1 - SUAVIZADO) * prob_suave
+                lleno = prob_suave >= UMBRAL_CONFIANZA
+                ahora = time.monotonic()
 
-        evento = monitor.actualizar(lleno, ahora)
-        if evento == "alerta":
-            print(f"\n\a🚨 ALERTA [{time.strftime('%H:%M:%S')}]: el almacenamiento está LLENO "
-                  f"hace {TIEMPO_ALERTA} s (confianza IA {prob_suave * 100:.0f}%)")
-        elif evento == "liberado":
-            print(f"\n✅ [{time.strftime('%H:%M:%S')}] El almacenamiento se liberó.")
+                evento = monitor.actualizar(lleno, ahora)
+                if evento == "alerta":
+                    print(f"\n\a🚨 ALERTA [{time.strftime('%H:%M:%S')}]: el almacenamiento está LLENO "
+                          f"hace {TIEMPO_ALERTA} s (confianza IA {prob_suave * 100:.0f}%)")
+                elif evento == "liberado":
+                    print(f"\n✅ [{time.strftime('%H:%M:%S')}] El almacenamiento se liberó.")
 
-        segundos = monitor.tiempo_lleno(ahora)
-        print(f"🤖 IA: {'LLENO' if lleno else 'vacío'} ({prob_suave * 100:5.1f}%) | "
-              f"lleno hace {segundos:4.1f}/{TIEMPO_ALERTA} s   ", end="\r")
+                segundos = monitor.tiempo_lleno(ahora)
+                texto = f"{'LLENO' if lleno else 'VACIO'} {prob_suave * 100:.0f}%  {segundos:.0f}/{TIEMPO_ALERTA}s"
+                print(f"🤖 IA: {'LLENO' if lleno else 'vacío'} ({prob_suave * 100:5.1f}%) | "
+                      f"lleno hace {segundos:4.1f}/{TIEMPO_ALERTA} s   ", end="\r")
 
-        _, jpeg = cv2.imencode('.jpg', dibujar(img, prob_suave, lleno, segundos))
-        with frame_lock:
-            latest_frame = jpeg.tobytes()
+            _, jpeg = cv2.imencode('.jpg', dibujar(img, texto))
+            with frame_lock:
+                latest_frame = jpeg.tobytes()
+        except Exception as e:
+            # Un error en un frame no tiene que frenar el stream
+            print(f"\n[⚠️] Error procesando un frame: {e}")
+            time.sleep(0.2)
 
 
 class StreamingHandler(BaseHTTPRequestHandler):
     def do_GET(self):
+        global latest_frame
         if self.path == '/':
             self.send_response(200)
             self.send_header('Content-type', 'text/html')
@@ -140,25 +174,28 @@ class StreamingHandler(BaseHTTPRequestHandler):
             </html>
             """
             self.wfile.write(html.encode('utf-8'))
+
         elif self.path == '/stream':
             self.send_response(200)
+            self.send_header('Age', '0')
             self.send_header('Cache-Control', 'no-cache, private')
+            self.send_header('Pragma', 'no-cache')
             self.send_header('Content-Type', 'multipart/x-mixed-replace; boundary=frame')
             self.end_headers()
-            last_sent = None
             try:
                 while True:
                     with frame_lock:
                         frame = latest_frame
-                    if frame is not None and frame is not last_sent:
-                        last_sent = frame
+
+                    if frame is not None:
                         self.wfile.write(b'--frame\r\n')
                         self.send_header('Content-Type', 'image/jpeg')
                         self.send_header('Content-Length', str(len(frame)))
                         self.end_headers()
                         self.wfile.write(frame)
                         self.wfile.write(b'\r\n')
-                    time.sleep(0.066)
+
+                    time.sleep(0.125)
             except Exception:
                 pass
         else:
@@ -168,12 +205,25 @@ class StreamingHandler(BaseHTTPRequestHandler):
         return
 
 
-if __name__ == '__main__':
-    threading.Thread(target=monitorear, daemon=True).start()
-    server = ThreadingHTTPServer(('0.0.0.0', PUERTO_WEB), StreamingHandler)
-    server.daemon_threads = True
-    print(f"[🌍] Stream en http://<IP-DE-LA-RADXA>:{PUERTO_WEB}")
+def hilo_camara():
     try:
-        server.serve_forever()
+        monitorear()
+    except Exception:
+        print("\n[❌] El hilo de la cámara se detuvo por un error:")
+        traceback.print_exc()
+
+
+def run_server():
+    server = HTTPServer(('0.0.0.0', PUERTO_WEB), StreamingHandler)
+    print("\n[🌍] Servidor Web Activo!")
+    print(f"     👉 Ingresá en tu navegador a: http://<IP-DE-LA-RADXA>:{PUERTO_WEB}\n")
+    server.serve_forever()
+
+
+if __name__ == '__main__':
+    thr = threading.Thread(target=hilo_camara, daemon=True)
+    thr.start()
+    try:
+        run_server()
     except KeyboardInterrupt:
         print("\n👋 Cerrando...")
